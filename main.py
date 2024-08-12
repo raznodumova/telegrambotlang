@@ -1,8 +1,10 @@
 import random
 
+from sqlalchemy import func, or_
 from telebot import types, TeleBot, custom_filters
 from telebot.storage import StateMemoryStorage
-from database.modelsdb import User, Word
+from database.modelsdb import User, Word, UserWord
+# from database.connectdb import Connection
 from sqlalchemy.orm import sessionmaker
 import sqlalchemy
 from configparser import ConfigParser
@@ -13,7 +15,7 @@ from mystates import MyStates
 
 def load_config():
     config = ConfigParser()
-    config.read('configdb.ini')
+    config.read(r'C:\Users\doc21\PycharmProjects\НАЧИНАЕМ ВСЕ СНАЧАЛА ТЕЛЕГА\database\configdb.ini')
     return config['database']
 
 
@@ -55,36 +57,47 @@ def get_user_step(uid):
         return 0
 
 
-def add_user(user_id):
-    if session.query(User).filter(User.id == user_id).first() is None:
-        user = User(id=user_id)
-        session.add(user)
-        session.commit()
+def add_user(user_id):  # не проверяю наличие пользователя в бд
+    user = User(id=user_id)
+    session.add(user)
+    session.commit()
+
+
+def add_user_word(user_id, word_id):
+    user_word = UserWord(user_id=user_id, word_id=word_id)
+    session.add(user_word)
+    session.commit()
 
 
 @bot.message_handler(commands=['cards', 'start'])
 def create_cards(message):
     cid = message.chat.id
-    if cid not in session.query(User).filter(User.id == cid).all():
+    user = session.query(User).filter(User.id == cid).first()  # больше нет запроса в блоке if
+    if user is None:
         add_user(cid)
         userStep[cid] = 0
         bot.send_message(cid, "Hello, stranger, let study English...")
 
     markup = types.ReplyKeyboardMarkup(row_width=2)
+    others = (
+        session.query(Word.word, Word.translate)
+        .join(UserWord, isouter=True)
+        .where(or_(
+            UserWord.user_id == None,
+            UserWord.user_id == cid,
+        ))
+        .order_by(func.random())
+        .limit(4)
+        .all()
+    )   # большое спасибо за наводку по запросу, использовала ее
+    target_word = random.choice(others)
+    target_word_txt = target_word.word
+    translate = target_word.translate
 
-    all_words = session.query(Word).all()
-    random_word = random.choice(all_words)
-    target_word = random_word.word
-    translate = random_word.translate
-
-    target_word_btn = types.KeyboardButton(target_word)
-    others = session.query(Word.word).filter(Word.word != target_word).all()
-    others = [word[0] for word in others]
-    random_others = random.sample(others, min(3, len(others)))
-    options = random_others + [target_word]
-
-    other_words_btns = [types.KeyboardButton(word) for word in options]
-    buttons = [target_word_btn] + random.sample(other_words_btns, len(other_words_btns))
+    other_words_btns = [types.KeyboardButton(word.word) for word in others if word.word != target_word_txt]
+    random_others = random.sample(other_words_btns, min(3, len(other_words_btns)))
+    target_word_btn = types.KeyboardButton(target_word_txt)
+    buttons = random_others + [target_word_btn]
     random.shuffle(buttons)
 
     next_btn = types.KeyboardButton(Command.NEXT)
@@ -99,9 +112,9 @@ def create_cards(message):
 
     bot.set_state(message.from_user.id, MyStates.target_word, message.chat.id)
     with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
-        data['target_word'] = target_word
+        data['target_word'] = target_word_txt
         data['translate_word'] = translate
-        data['other_words'] = others
+        data['other_words'] = [word.word for word in others]
 
 
 @bot.message_handler(func=lambda message: message.text == Command.NEXT)
@@ -110,7 +123,7 @@ def next_cards(message):
 
 
 @bot.message_handler(func=lambda message: message.text == Command.ADD_WORD)
-def add_word(message):
+def add_word(message):  # не проверяю пользователя в БД
     cid = message.chat.id
     userStep[cid] = 1
     bot.send_message(message.chat.id, "Введите слово и его перевод в формате: слово: перевод")
@@ -127,6 +140,9 @@ def save_word(message):
     new_word = Word(word=word, translate=translate)
     session.add(new_word)
     session.commit()
+    word_id = new_word.id
+    add_user_word(cid, word_id)
+    session.commit()
     session.close()
 
     bot.send_message(cid, f"Слово '{word}' успешно добавлено!")
@@ -137,31 +153,34 @@ def save_word(message):
 def delete_word(message):
     cid = message.chat.id
     userStep[cid] = 2
-    bot.send_message(cid, "Введите слово для удаления в формате 'слово: перевод'.")
+    bot.send_message(cid, "Введите слово для удаления")
 
 
-@bot.message_handler(func=lambda message: userStep.get(message.chat.id) == 2)
+@bot.message_handler(func=lambda message: userStep.get(message.chat.id) == 2)   # теперь пользователь может удалять только свои слова
 def confirm_delete_word(message):
     cid = message.chat.id
-    try:
-        word, translate = message.text.split(':')
-        word = word.strip()
-        translate = translate.strip()
+    word_to_delete = message.text.strip()
 
-        session = Session()
-        word_to_delete = session.query(Word).filter_by(word=word, translate=translate).first()
-        if word_to_delete:
-            session.delete(word_to_delete)
+    session = Session()
+
+    word_record = session.query(Word).filter(Word.word == word_to_delete).first()
+    if word_record:
+        if word_record.id > 10:
+            user_word_records = session.query(UserWord).filter(UserWord.word_id == word_record.id).all()
+
+            for user_word in user_word_records:
+                session.delete(user_word)
+            session.delete(word_record)
             session.commit()
-            bot.send_message(cid, f"Слово '{word}' успешно удалено!")
-        else:
-            bot.send_message(cid, f"Слово '{word}' не найдено.")
 
-        session.close()
-    except ValueError:
-        bot.send_message(cid, "Ошибка! Пожалуйста, используй формат: 'слово: перевод'.")
-    finally:
-        userStep[cid] = 0
+            bot.send_message(cid, f"Слово '{word_to_delete}' удалено)")
+        else:
+            bot.send_message(cid, f"Слово '{word_to_delete}' невозможно удалить(")
+    else:
+        bot.send_message(cid, f"Слово '{word_to_delete}' не найдено(")
+
+    session.close()
+    userStep[cid] = 0
 
 
 @bot.message_handler(func=lambda message: True, content_types=['text'])
